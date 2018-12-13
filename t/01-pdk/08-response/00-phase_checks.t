@@ -151,6 +151,17 @@ qq{
                 body_filter   = true,
                 log           = true,
                 admin_api     = true,
+            }, {
+                method        = "get_default_exit_body",
+                args          = { 200 },
+                init_worker   = true,
+                certificate   = "pending",
+                rewrite       = true,
+                access        = true,
+                header_filter = true,
+                body_filter   = true,
+                log           = true,
+                admin_api     = true,
             }
         }
 

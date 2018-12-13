@@ -599,6 +599,84 @@ local function new(self, major_version)
     end
   end
 
+  ---
+  -- Given an http status and an optional message, this function will
+  -- return a body that could be used in `kong.response.exit` (it is not
+  -- mandatory to use `kong.response.get_default_exit_body this way)
+  --
+  -- * status 204 will always return nil for the body
+  -- * 405, 500 & 502 always return a predefined message
+  -- * If there is a message, it will be used as a body
+  -- * Otherwise, there's a default body for 401, 404 & 503 responses
+  --
+  -- If after applying those rules there's a body, and that body isn't a
+  -- table, it will be transformed into one of the form `{ message = ... }`,
+  -- where `...` is the untransformed body.
+  --
+  -- This function throws error on invalid input
+  --
+  -- @function kong.response.get_default_exit_body
+  -- @phases all
+  -- @tparam number status The status to be used
+  -- @tparam[opt] table|string message The message to be used
+  -- @tparam[opt] table headers The headers to be used
+  -- @return table|nil a possible body which can be used in kong.response.exit
+  -- @usage
+  --
+  -- --- 204 always returns nil
+  -- kong.response.get_default_exit_body(204) --> nil
+  -- kong.response.get_default_exit_body(204, "foo") --> nil
+  --
+  -- --- 405, 500 & 502 always return predefined values
+  --
+  -- kong.response.get_default_exit_body(502, "ignored") --> { message = "Bad gateway" }
+  --
+  -- --- If message is a table, it is returned
+  --
+  -- kong.response.get_default_exit_body(200, { ok = true }) --> { ok = true }
+  --
+  -- --- If message is not a table, it is transformed into one
+  --
+  -- kong.response.get_default_exit_body(200, "ok") --> { message = "ok" }
+  --
+  -- --- 401, 404 and 503 provide default values if none is defined
+  --
+  -- kong.response.get_default_exit_body(404) --> { message = "Not found" }
+  --
+  do
+    local _overrides = {
+      [405] = "Method not allowed",
+      [500] = "An unexpected error occurred",
+      [502] = "Bad gateway",
+    }
+
+    local _defaults = {
+      [401] = "Unauthorized",
+      [404] = "Not found",
+      [503] = "Service unavailable",
+    }
+
+    function _RESPONSE.get_default_exit_body(status, message)
+      if type(status) ~= "number" then
+        error("code must be a number", 2)
+
+      elseif status < MIN_STATUS_CODE or status > MAX_STATUS_CODE then
+        error(fmt("code must be a number between %u and %u", MIN_STATUS_CODE, MAX_STATUS_CODE), 2)
+      end
+
+      if status == 204 then
+        return nil
+      end
+
+      local body = _overrides[status] or message or _defaults[status]
+      if body ~= nil and type(body) ~= "table" then
+        body = { message = body }
+      end
+
+      return body
+    end
+  end
+
 
   return _RESPONSE
 end
