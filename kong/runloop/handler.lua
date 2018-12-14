@@ -22,6 +22,7 @@ local certificate = require "kong.runloop.certificate"
 
 
 local kong        = kong
+local pcall       = pcall
 local tostring    = tostring
 local tonumber    = tonumber
 local sub         = string.sub
@@ -34,9 +35,11 @@ local ngx_now     = ngx.now
 local update_time = ngx.update_time
 local subsystem   = ngx.config.subsystem
 local unpack      = unpack
+local yield       = coroutine.yield
 
 
 local ERR         = ngx.ERR
+local CRIT        = ngx.CRIT
 local DEBUG       = ngx.DEBUG
 
 
@@ -44,7 +47,12 @@ local CACHE_ROUTER_OPTS = { ttl = 0 }
 local EMPTY_T = {}
 
 
-local get_router, build_router
+local init_router
+local get_router
+local build_router
+local rebuild_router
+
+
 local server_header = meta._SERVER_TOKENS
 
 
@@ -68,13 +76,83 @@ do
 
   local router
   local router_version
+  local router_wait = 5
 
-  build_router = function(db, version)
-    local routes, i = {}, 0
+  local lock_router
+  local unlock_router
+  local get_router_version
+  local build_router_timer
 
-    for route, err in db.routes:each() do
+  lock_router = function(wait)
+    if wait then
+      yield()
+    end
+
+    local ok, err = build_router_semaphore:wait(wait or 0)
+    if not ok then
+      if wait then
+        log(ERR, "error attempting to acquire build_router lock: " .. err)
+      end
+
+      return nil
+    end
+
+    return true
+  end
+
+  unlock_router = function()
+    build_router_semaphore:post()
+  end
+
+  init_router = function()
+    local err
+    build_router_semaphore, err = semaphore.new(1)
+    if err then
+      log(CRIT, "failed to create build_router_semaphore: ", err)
+    end
+
+    if kong.configuration.database == "cassandra" then
+      router_wait = kong.configuration.cassandra_timeout / 1000
+
+    elseif singletons.configuration.database == "postgres" then
+      router_wait = kong.configuration.pg_timeout / 1000
+    end
+  end
+
+  get_router_version = function()
+    local version, err = kong.cache:get("router:version", CACHE_ROUTER_OPTS, utils.uuid)
+    if err then
+      log(CRIT, "could not ensure router is up to date: ", err)
+      return nil
+    end
+
+    return version
+  end
+
+  build_router = function(version)
+    local current_version
+
+    if version ~= "init" then
+      current_version = get_router_version()
+      if version ~= current_version then
+        return build_router(current_version)
+      end
+    end
+
+    local routes, i, counter = {}, 0, 0
+
+    for route, err in kong.db.routes:each(1000) do
       if err then
         return nil, "could not load routes: " .. err
+      end
+
+      if counter % 1000 then
+        if version ~= "init" then
+          current_version = get_router_version()
+          if version ~= current_version then
+            return build_router(current_version)
+          end
+        end
       end
 
       local service_pk = route.service
@@ -83,7 +161,7 @@ do
         return nil, "route (" .. route.id .. ") is not associated with service"
       end
 
-      local service, err = db.services:select(service_pk)
+      local service, err = kong.db.services:select(service_pk)
       if not service then
         return nil, "could not find service for route (" .. route.id .. "): " ..
                     err
@@ -106,6 +184,15 @@ do
         i = i + 1
         routes[i] = r
       end
+
+      counter = counter + 1
+    end
+
+    if version ~= "init" then
+      current_version = get_router_version()
+      if version ~= current_version then
+        return build_router(current_version)
+      end
     end
 
     sort(routes, function(r1, r2)
@@ -116,83 +203,65 @@ do
       return r1.regex_priority > r2.regex_priority
     end)
 
-    local err
-    router, err = Router.new(routes)
-    if not router then
+    local new_router, err = Router.new(routes)
+    if not new_router then
       return nil, "could not create router: " .. err
     end
 
-    if version then
-      router_version = version
-    end
+    router_version = version
+    router = new_router
 
-    singletons.router = router
+    singletons.router = new_router
 
     return true
   end
 
-
-  get_router = function()
-    local cache = singletons.cache
-
-    local version, err = cache:get("router:version", CACHE_ROUTER_OPTS,
-                                   utils.uuid)
-    if err then
-      log(ngx.CRIT, "could not ensure router is up to date: ", err)
-      return nil, err
+  build_router_timer = function(premature)
+    if premature then
+      return unlock_router()
     end
 
+    local pok, ok, err = pcall(build_router)
+    if not pok or not ok then
+      log(CRIT, "could not rebuild router: ", ok or err)
+    end
+
+    return unlock_router()
+  end
+
+  rebuild_router = function(wait)
+    local version = get_router_version()
     if version == router_version then
-      return router
+      return
     end
 
-    -- wrap router rebuilds in a per-worker mutex (via ngx.semaphore)
-    -- this prevents dogpiling the database during rebuilds in
-    -- high-concurrency traffic patterns
-    -- requests that arrive on this process during a router rebuild will be
-    -- queued. once the semaphore resource is acquired we re-check the
-    -- router version again to prevent unnecessary subsequent rebuilds
-
-    local timeout = 60
-    if singletons.configuration.database == "cassandra" then
-      -- cassandra_timeout is defined in ms
-      timeout = singletons.configuration.cassandra_timeout / 1000
-
-    elseif singletons.configuration.database == "postgres" then
-      -- pg_timeout is defined in ms
-      timeout = singletons.configuration.pg_timeout / 1000
-    end
-
-    local ok, err = build_router_semaphore:wait(timeout)
+    local ok = lock_router(wait)
     if not ok then
-      return nil, "error attempting to acquire build_router lock: " .. err
+      return
     end
 
-    -- lock acquired but we might not need to rebuild the router (if we
-    -- were not the first request in this process to enter this code path)
-    -- check again and rebuild if necessary
-
-    version, err = cache:get("router:version", CACHE_ROUTER_OPTS, utils.uuid)
-    if err then
-      log(ngx.CRIT, "could not ensure router is up to date: ", err)
-      return nil, err
-    end
-
+    local version = get_router_version()
     if version == router_version then
-      return router
+      return unlock_router()
     end
 
-    -- router needs to be rebuilt in this worker
     log(DEBUG, "rebuilding router")
 
-    local ok, err = build_router(singletons.db, version)
+    local ok, err = ngx.timer.at(0, build_router_timer)
     if not ok then
-      log(ngx.CRIT, "could not rebuild router: ", err)
-      return nil, err
+      log(CRIT, "could not create rebuild router timer: ", err)
+
+      local pok, ok, err = pcall(build_router, version)
+      if not pok or not ok then
+        log(CRIT, "could not rebuild router: ", ok or err)
+      end
+
+      return unlock_router()
     end
+  end
 
-    build_router_semaphore:post(1)
-
+  get_router = function()
+    rebuild_router(router_wait)
     return router
   end
 end
@@ -291,10 +360,10 @@ return {
       reports.init_worker()
 
       -- initialize local local_events hooks
-      local db             = singletons.db
-      local cache          = singletons.cache
-      local worker_events  = singletons.worker_events
-      local cluster_events = singletons.cluster_events
+      local db             = kong.db
+      local cache          = kong.cache
+      local worker_events  = kong.worker_events
+      local cluster_events = kong.cluster_events
 
 
       -- events dispatcher
@@ -363,6 +432,15 @@ return {
       worker_events.register(function()
         log(DEBUG, "[events] Route updated, invalidating router")
         cache:invalidate("router:version")
+        local ok, err = worker_events.post("router", "rebuild")
+        if not ok then
+          log(ERR, "failed broadcasting router rebuild event to workers: ", err)
+        end
+
+        ok, err = cluster_events:broadcast("router", "rebuild")
+        if not ok then
+          log(ERR, "failed broadcasting router rebuild event to cluster: ", err)
+        end
       end, "crud", "routes")
 
 
@@ -376,9 +454,25 @@ return {
           -- only allowed because no Route is pointing to it anymore.
           log(DEBUG, "[events] Service updated, invalidating router")
           cache:invalidate("router:version")
+          local ok, err = worker_events.post("router", "rebuild")
+          if not ok then
+            log(ERR, "failed broadcasting router rebuild event to workers: ", err)
+          end
+
+          ok, err = cluster_events:broadcast("router", "rebuild")
+          if not ok then
+            log(ERR, "failed broadcasting router rebuild event to cluster: ", err)
+          end
         end
       end, "crud", "services")
 
+      worker_events.register(function()
+        rebuild_router()
+      end, "router", "rebuild")
+
+      cluster_events:subscribe("router", function()
+        rebuild_router()
+      end)
 
       worker_events.register(function(data)
         -- assume an update doesnt also change the whole entity!
@@ -536,16 +630,7 @@ return {
         balancer.init()
       end)
 
-      do
-        local err
-
-        build_router_semaphore, err = semaphore.new()
-        if err then
-          log(ngx.CRIT, "failed to create build_router_semaphore: ", err)
-        end
-
-        build_router_semaphore:post(1)
-      end
+      init_router()
     end
   },
   certificate = {
@@ -831,7 +916,7 @@ return {
       ctx.KONG_HEADER_FILTER_STARTED_AT = now
 
       local upstream_status_header = constants.HEADERS.UPSTREAM_STATUS
-      if singletons.configuration.enabled_headers[upstream_status_header] then
+      if kong.configuration.enabled_headers[upstream_status_header] then
         header[upstream_status_header] = tonumber(sub(ngx.var.upstream_status or "", -3))
         if not header[upstream_status_header] then
           log(ERR, "failed to set ", upstream_status_header, " header")
@@ -856,20 +941,20 @@ return {
       local header = ngx.header
 
       if ctx.KONG_PROXIED then
-        if singletons.configuration.enabled_headers[constants.HEADERS.UPSTREAM_LATENCY] then
+        if kong.configuration.enabled_headers[constants.HEADERS.UPSTREAM_LATENCY] then
           header[constants.HEADERS.UPSTREAM_LATENCY] = ctx.KONG_WAITING_TIME
         end
 
-        if singletons.configuration.enabled_headers[constants.HEADERS.PROXY_LATENCY] then
+        if kong.configuration.enabled_headers[constants.HEADERS.PROXY_LATENCY] then
           header[constants.HEADERS.PROXY_LATENCY] = ctx.KONG_PROXY_LATENCY
         end
 
-        if singletons.configuration.enabled_headers[constants.HEADERS.VIA] then
+        if kong.configuration.enabled_headers[constants.HEADERS.VIA] then
           header[constants.HEADERS.VIA] = server_header
         end
 
       else
-        if singletons.configuration.enabled_headers[constants.HEADERS.SERVER] then
+        if kong.configuration.enabled_headers[constants.HEADERS.SERVER] then
           header[constants.HEADERS.SERVER] = server_header
 
         else

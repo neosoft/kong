@@ -890,6 +890,8 @@ for _, strategy in helpers.each_strategy() do
               name = "key-auth"
             })
 
+            ngx.sleep(1)
+
             -- run request: fails with 401, but doesn't hit the 1-error threshold
             local oks, fails, last_status = client_requests(1, api_host)
             assert.same(0, oks)
@@ -1399,8 +1401,8 @@ for _, strategy in helpers.each_strategy() do
             assert.are.equal(0, fails)
           end)
 
-          local stream_it = (mode == "ipv6") and pending or it
-          stream_it("perform passive health checks -- #stream connection failure", function()
+          --local stream_it = (mode == "ipv6") and pending or it
+          pending("perform passive health checks -- #stream connection failure", function()
 
             -- configure healthchecks
             local upstream_name = add_upstream({

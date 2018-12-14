@@ -418,7 +418,7 @@ local function generate_foreign_key_methods(schema)
           return nil, err, err_t
         end
 
-        if rbw_entity then
+        if rbw_entity and self:cache_key(rbw_entity) ~= self:cache_key(row) then
           self:post_crud_event("update", rbw_entity)
         end
 
@@ -758,7 +758,7 @@ function DAO:update(primary_key, entity, options)
     return nil, err, err_t
   end
 
-  if rbw_entity then
+  if rbw_entity and self:cache_key(rbw_entity) ~= self:cache_key(row) then
     self:post_crud_event("update", rbw_entity)
   end
 
